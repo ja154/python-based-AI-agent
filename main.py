@@ -5,14 +5,18 @@ import sys
 from typing import Any
 
 from dotenv import load_dotenv
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain_anthropic import ChatAnthropic
+from langchain_classic.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel
 
 from tools import save_tool, search_tool, wiki_tool
+
+DEFAULT_ANTHROPIC_MODEL = "claude-3-5-sonnet-20241022"
+DEFAULT_OLLAMA_MODEL = "qwen2.5:3b-instruct"
+DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+SUPPORTED_PROVIDERS = {"anthropic", "ollama"}
 
 
 class ResearchResponse(BaseModel):
@@ -28,11 +32,55 @@ def redact(text: str, max_len: int = 1000) -> str:
     return text
 
 
-def _validate_environment() -> None:
-    if not os.getenv("ANTHROPIC_API_KEY"):
+def _provider_from_env() -> str:
+    provider = os.getenv("MODEL_PROVIDER", "anthropic").strip().lower()
+    if provider not in SUPPORTED_PROVIDERS:
         raise RuntimeError(
-            "Missing ANTHROPIC_API_KEY. Set it in your environment or .env before running."
+            f"Unsupported MODEL_PROVIDER='{provider}'. Use one of: {sorted(SUPPORTED_PROVIDERS)}"
         )
+    return provider
+
+
+def _validate_environment(provider: str) -> None:
+    if provider == "anthropic":
+        if not os.getenv("ANTHROPIC_API_KEY"):
+            raise RuntimeError(
+                "Missing ANTHROPIC_API_KEY. Set it in your environment or .env for Anthropic."
+            )
+        return
+
+    if provider == "ollama":
+        # OLLAMA_MODEL and OLLAMA_BASE_URL have defaults.
+        return
+
+    raise RuntimeError(f"Unsupported provider: {provider}")
+
+
+def _build_llm(provider: str) -> Any:
+    if provider == "anthropic":
+        try:
+            from langchain_anthropic import ChatAnthropic
+        except ImportError as exc:
+            raise RuntimeError(
+                "langchain-anthropic is not installed. Install requirements and retry."
+            ) from exc
+
+        anthropic_model = os.getenv("ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL)
+        return ChatAnthropic(model=anthropic_model, streaming=True)
+
+    if provider == "ollama":
+        try:
+            from langchain_ollama import ChatOllama
+        except ImportError as exc:
+            raise RuntimeError(
+                "langchain-ollama is not installed. Add it to requirements and install dependencies."
+            ) from exc
+
+        ollama_model = os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
+        ollama_base_url = os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL)
+        return ChatOllama(model=ollama_model, base_url=ollama_base_url, streaming=True)
+
+    raise RuntimeError(f"Unsupported provider: {provider}")
 
 
 def _build_prompt(parser_obj: PydanticOutputParser) -> ChatPromptTemplate:
@@ -54,9 +102,9 @@ Return only valid JSON matching this schema and no additional text:
 
 def build_research_runtime(verbose: bool = False) -> tuple[PydanticOutputParser, AgentExecutor]:
     load_dotenv()
-    _validate_environment()
-
-    llm = ChatAnthropic(model="claude-3-5-sonnet-20241022", streaming=True)
+    provider = _provider_from_env()
+    _validate_environment(provider)
+    llm = _build_llm(provider)
     parser_obj = PydanticOutputParser(pydantic_object=ResearchResponse)
     prompt = _build_prompt(parser_obj)
 

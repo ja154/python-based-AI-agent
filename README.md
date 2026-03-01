@@ -1,6 +1,9 @@
 # Python AI Agent (CLI + Local Web Chat)
 
-Simple research agent built with LangChain tools and Anthropic.
+Simple research agent with LangChain tools and a switchable model provider:
+
+- `anthropic` (online API)
+- `ollama` (local model)
 
 ## 1) Setup
 
@@ -19,16 +22,38 @@ sudo apt-get install -y python3.12-venv
 
 ## 2) Environment Variables
 
-Create `.env` from `sample.env` and set values:
+Create `.env` from `sample.env` and set values.
+
+### Anthropic mode
 
 ```env
+MODEL_PROVIDER="anthropic"
 ANTHROPIC_API_KEY="your-key"
+ANTHROPIC_MODEL="claude-3-5-sonnet-20241022"
+```
+
+### Ollama mode
+
+```env
+MODEL_PROVIDER="ollama"
+OLLAMA_MODEL="qwen2.5:3b-instruct"
+OLLAMA_BASE_URL="http://127.0.0.1:11434"
+```
+
+Keep in `.env` for web session storage:
+
+```env
 FLASK_SECRET_KEY="any-random-local-string"
 ```
 
-`OPENAI_API_KEY` is optional and not used by default.
+## 3) Ollama Local Model Setup
 
-## 3) Run CLI Agent
+```bash
+ollama pull qwen2.5:3b-instruct
+ollama run qwen2.5:3b-instruct "hello"
+```
+
+## 4) Run CLI Agent
 
 Interactive:
 
@@ -42,7 +67,7 @@ Single query:
 python main.py --query "Research edge AI chip trends in 2026"
 ```
 
-## 4) Run Browser Chat UI (Local)
+## 5) Run Browser Chat UI (Local)
 
 ```bash
 python web_chat.py
@@ -52,6 +77,7 @@ Open: `http://127.0.0.1:5000`
 
 ## Notes
 
+- Provider is selected by `MODEL_PROVIDER` in `.env`.
 - Chat history is session-based in your browser.
 - Browser chat streams response tokens live while the agent is generating.
 - `research_output.txt` is ignored by git and can be written by the save tool.

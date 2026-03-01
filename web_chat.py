@@ -342,7 +342,7 @@ HTML_PAGE = """
       <ul id="historyList" class="history-list">
         <li class="history-empty">No prompts yet</li>
       </ul>
-      <div class="sidebar-foot">Model: Claude 3.5 Sonnet</div>
+      <div class="sidebar-foot">Provider: Anthropic or Ollama (from .env)</div>
     </aside>
 
     <main class="chat-shell">
