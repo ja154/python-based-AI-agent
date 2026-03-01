@@ -7,4 +7,5 @@ langchain-ollama
 python-dotenv
 pydantic
 duckduckgo-search
+ddgs
 flask
