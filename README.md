@@ -1,6 +1,6 @@
-# Python AI Agent (CLI + Local Web Chat)
+# Jengo AI Research Agent (CLI + Local Web Chat)
 
-Simple research agent with LangChain tools and a switchable model provider:
+Jengo is an AI research agent with LangChain tools and a switchable model provider:
 
 - `anthropic` (online API)
 - `ollama` (local model)
@@ -75,9 +75,25 @@ python web_chat.py
 
 Open: `http://127.0.0.1:5000`
 
+## 6) Upload Documents For Analysis
+
+In the web chat UI:
+
+1. Click `Attach`
+2. Select one or more files
+3. Ask a question, or send an empty message to analyze the uploaded docs directly
+
+Supported formats:
+
+- Text/code/config files (`.txt`, `.md`, `.csv`, `.json`, `.yaml`, `.py`, etc.)
+- PDF (`.pdf`)
+- Word (`.docx`)
+
 ## Notes
 
 - Provider is selected by `MODEL_PROVIDER` in `.env`.
+- Jengo has a fixed identity/personality and can explain capabilities on demand.
 - Chat history is session-based in your browser.
+- Uploaded docs are stored per chat session and cleared on `New Chat`.
 - Browser chat streams response tokens live while the agent is generating.
 - `research_output.txt` is ignored by git and can be written by the save tool.

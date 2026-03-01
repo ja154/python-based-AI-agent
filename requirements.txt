@@ -9,3 +9,5 @@ pydantic
 duckduckgo-search
 ddgs
 flask
+pypdf
+python-docx

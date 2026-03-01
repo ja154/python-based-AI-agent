@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import io
 import json
 import os
 import queue
@@ -15,6 +18,7 @@ from flask import (
     stream_with_context,
 )
 from langchain_core.callbacks import BaseCallbackHandler
+from werkzeug.datastructures import FileStorage
 
 from main import ResearchResponse, build_research_runtime, run_research
 
@@ -22,6 +26,34 @@ load_dotenv()
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "local-dev-secret")
+
+MAX_UPLOAD_FILES = 6
+MAX_SINGLE_DOC_CHARS = 12000
+MAX_TOTAL_DOC_CHARS = 60000
+MAX_UPLOAD_BYTES = 6 * 1024 * 1024
+TEXT_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".markdown",
+    ".csv",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".log",
+    ".xml",
+    ".html",
+    ".htm",
+    ".py",
+    ".js",
+    ".ts",
+    ".java",
+    ".go",
+    ".rs",
+    ".sql",
+    ".ini",
+    ".cfg",
+    ".toml",
+}
 
 RUNTIME = None
 RUNTIME_ERROR = None
@@ -57,13 +89,173 @@ def sse_event(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _safe_filename(filename: str) -> str:
+    name = os.path.basename(str(filename or "").strip())
+    return name[:180]
+
+
+def _trim_text(value: str, max_chars: int) -> str:
+    value = str(value or "").strip()
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars] + f"\n... ({len(value) - max_chars} more characters)"
+
+
+def _decode_text_blob(blob: bytes) -> str | None:
+    for encoding in ("utf-8", "utf-16", "latin-1"):
+        try:
+            return blob.decode(encoding)
+        except Exception:
+            continue
+    return None
+
+
+def _extract_text_from_upload(upload: FileStorage) -> tuple[str | None, str | None]:
+    filename = _safe_filename(upload.filename)
+    if not filename:
+        return None, "missing filename"
+
+    blob = upload.read()
+    if not blob:
+        return None, "empty file"
+    if len(blob) > MAX_UPLOAD_BYTES:
+        return None, f"file too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)"
+
+    extension = os.path.splitext(filename)[1].lower()
+    if extension in TEXT_EXTENSIONS:
+        decoded = _decode_text_blob(blob)
+        if decoded is None:
+            return None, "could not decode text content"
+        return _trim_text(decoded, MAX_SINGLE_DOC_CHARS), None
+
+    if extension == ".pdf":
+        try:
+            from pypdf import PdfReader
+        except Exception:
+            return None, "PDF parsing requires pypdf"
+
+        try:
+            reader = PdfReader(io.BytesIO(blob))
+            parts: list[str] = []
+            for page in reader.pages[:25]:
+                page_text = page.extract_text() or ""
+                if page_text.strip():
+                    parts.append(page_text.strip())
+            if not parts:
+                return None, "no extractable PDF text found"
+            return _trim_text("\n\n".join(parts), MAX_SINGLE_DOC_CHARS), None
+        except Exception as exc:
+            return None, f"PDF read error: {exc}"
+
+    if extension == ".docx":
+        try:
+            from docx import Document
+        except Exception:
+            return None, "DOCX parsing requires python-docx"
+
+        try:
+            document = Document(io.BytesIO(blob))
+            parts = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
+            if not parts:
+                return None, "no extractable DOCX text found"
+            return _trim_text("\n\n".join(parts), MAX_SINGLE_DOC_CHARS), None
+        except Exception as exc:
+            return None, f"DOCX read error: {exc}"
+
+    decoded = _decode_text_blob(blob)
+    if decoded is not None:
+        return _trim_text(decoded, MAX_SINGLE_DOC_CHARS), None
+
+    return None, f"unsupported file type: {extension or 'unknown'}"
+
+
+def _merge_uploaded_docs(
+    existing_docs: list[dict[str, str]] | None,
+    uploads: list[FileStorage],
+) -> tuple[list[dict[str, str]], list[str], list[str]]:
+    docs_map: dict[str, str] = {}
+    for item in existing_docs or []:
+        name = _safe_filename(item.get("name", ""))
+        text = str(item.get("text", ""))
+        if name and text:
+            docs_map[name] = text
+
+    added_names: list[str] = []
+    errors: list[str] = []
+
+    for upload in uploads:
+        name = _safe_filename(upload.filename)
+        if not name:
+            continue
+
+        if len(docs_map) >= MAX_UPLOAD_FILES and name not in docs_map:
+            errors.append(f"{name}: maximum of {MAX_UPLOAD_FILES} documents reached")
+            continue
+
+        text, error = _extract_text_from_upload(upload)
+        if error:
+            errors.append(f"{name}: {error}")
+            continue
+
+        docs_map[name] = text or ""
+        if name not in added_names:
+            added_names.append(name)
+
+    updated_docs = [{"name": name, "text": text} for name, text in docs_map.items()]
+    return updated_docs, added_names, errors
+
+
+def _build_document_context(uploaded_docs: list[dict[str, str]] | None) -> tuple[str, list[str]]:
+    docs = uploaded_docs or []
+    if not docs:
+        return "", []
+
+    blocks: list[str] = []
+    sources: list[str] = []
+    total_chars = 0
+
+    for item in docs:
+        name = _safe_filename(item.get("name", ""))
+        text = _trim_text(item.get("text", ""), MAX_SINGLE_DOC_CHARS)
+        if not name or not text:
+            continue
+
+        block = f"[Document: {name}]\n{text}"
+        if total_chars + len(block) > MAX_TOTAL_DOC_CHARS:
+            remaining = MAX_TOTAL_DOC_CHARS - total_chars
+            if remaining <= 0:
+                break
+            block = _trim_text(block, max_chars=remaining)
+        blocks.append(block)
+        total_chars += len(block)
+        sources.append(f"uploaded:{name}")
+        if total_chars >= MAX_TOTAL_DOC_CHARS:
+            break
+
+    return "\n\n".join(blocks), sources
+
+
+def _parse_chat_payload() -> tuple[str, list[FileStorage]]:
+    if request.is_json:
+        data = request.get_json(silent=True) or {}
+        return str(data.get("message", "")).strip(), []
+
+    message = str(request.form.get("message", "")).strip()
+    uploads = request.files.getlist("files")
+    return message, uploads
+
+
+def _default_query_for_docs() -> str:
+    return "Analyze the uploaded documents and provide concise key findings."
+
+
 HTML_PAGE = """
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Local Research Agent Chat</title>
+  <title>Jengo Research Chat</title>
   <style>
     :root {
       --bg: #ececec;
@@ -102,7 +294,7 @@ HTML_PAGE = """
       border-radius: 14px;
       padding: 14px 12px;
       display: grid;
-      grid-template-rows: auto auto auto 1fr auto;
+      grid-template-rows: auto auto auto auto 1fr auto;
       gap: 12px;
       box-shadow: 0 12px 34px rgba(0, 0, 0, 0.22);
     }
@@ -195,7 +387,8 @@ HTML_PAGE = """
       color: var(--subtle);
     }
     .topbar button,
-    .send-btn {
+    .send-btn,
+    .attach-btn {
       border: 0;
       background: var(--accent);
       color: #fff;
@@ -205,11 +398,13 @@ HTML_PAGE = """
       font-weight: 600;
     }
     .topbar button:hover,
-    .send-btn:hover {
+    .send-btn:hover,
+    .attach-btn:hover {
       background: var(--accent-2);
     }
     .topbar button:disabled,
-    .send-btn:disabled {
+    .send-btn:disabled,
+    .attach-btn:disabled {
       opacity: 0.6;
       cursor: not-allowed;
     }
@@ -281,13 +476,13 @@ HTML_PAGE = """
     }
     .composer-box {
       display: grid;
-      grid-template-columns: 1fr auto;
+      grid-template-columns: auto 1fr auto;
       align-items: center;
       gap: 8px;
       border: 1px solid var(--line);
       border-radius: 14px;
       background: #fff;
-      padding: 6px 7px 6px 12px;
+      padding: 6px 7px 6px 8px;
       box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.8);
     }
     textarea {
@@ -302,6 +497,11 @@ HTML_PAGE = """
       background: #fff;
       color: var(--text);
     }
+    .attach-btn {
+      min-width: 70px;
+      padding: 9px 10px;
+      font-size: 12px;
+    }
     .send-btn {
       width: 38px;
       height: 38px;
@@ -314,6 +514,24 @@ HTML_PAGE = """
       font-size: 12px;
       color: var(--subtle);
       padding-left: 2px;
+    }
+    .docs-list {
+      margin-top: 3px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .doc-chip {
+      font-size: 11px;
+      color: #13493f;
+      background: #dff3ec;
+      border: 1px solid #b7ddd0;
+      border-radius: 999px;
+      padding: 3px 8px;
+      white-space: nowrap;
+      max-width: 220px;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     @keyframes rise {
       from { opacity: 0; transform: translateY(6px); }
@@ -336,20 +554,24 @@ HTML_PAGE = """
 <body>
   <div class="app-shell">
     <aside class="sidebar">
-      <div class="brand">LocalGPT Research</div>
+      <div class="brand">Jengo Research</div>
       <button id="sidebarNewBtn" type="button">+ New chat</button>
+      <div class="history-title">Loaded Documents</div>
+      <ul id="docsListSidebar" class="history-list">
+        <li class="history-empty">No documents uploaded</li>
+      </ul>
       <div class="history-title">Recent Prompts</div>
       <ul id="historyList" class="history-list">
         <li class="history-empty">No prompts yet</li>
       </ul>
-      <div class="sidebar-foot">Provider: Anthropic or Ollama (from .env)</div>
+      <div class="sidebar-foot">Jengo supports local Ollama and Anthropic.</div>
     </aside>
 
     <main class="chat-shell">
       <header class="topbar">
         <div>
-          <h1 class="topbar-title">Research Assistant</h1>
-          <div class="topbar-sub">Web + Wikipedia + file save tools enabled</div>
+          <h1 class="topbar-title">Jengo</h1>
+          <div class="topbar-sub">AI research agent with web, Wikipedia, and document analysis</div>
         </div>
         <button id="resetBtn" type="button">New Chat</button>
       </header>
@@ -358,9 +580,13 @@ HTML_PAGE = """
 
       <form id="chatForm" class="composer-wrap">
         <div class="composer-box">
-          <textarea id="messageInput" placeholder="Message Research Assistant" rows="1" required></textarea>
+          <button id="attachBtn" class="attach-btn" type="button">Attach</button>
+          <input id="fileInput" type="file" multiple hidden />
+          <textarea id="messageInput" placeholder="Message Jengo" rows="1"></textarea>
           <button id="sendBtn" class="send-btn" type="submit" title="Send">↑</button>
         </div>
+        <div class="composer-hint" id="docsHint">No documents queued.</div>
+        <div class="docs-list" id="docsList"></div>
         <div class="composer-hint">Enter sends, Shift+Enter adds a new line.</div>
       </form>
     </main>
@@ -374,7 +600,14 @@ HTML_PAGE = """
     const resetBtn = document.getElementById("resetBtn");
     const sidebarNewBtn = document.getElementById("sidebarNewBtn");
     const historyList = document.getElementById("historyList");
+    const docsListSidebar = document.getElementById("docsListSidebar");
+    const attachBtn = document.getElementById("attachBtn");
+    const fileInput = document.getElementById("fileInput");
+    const docsHint = document.getElementById("docsHint");
+    const docsList = document.getElementById("docsList");
+
     let promptHistory = [];
+    let loadedDocs = [];
 
     function addMessage(text, role) {
       const row = document.createElement("div");
@@ -382,7 +615,7 @@ HTML_PAGE = """
 
       const avatar = document.createElement("div");
       avatar.className = `avatar ${role === "system" ? "assistant" : role}`;
-      avatar.textContent = role === "user" ? "U" : "AI";
+      avatar.textContent = role === "user" ? "U" : "J";
 
       const bubble = document.createElement("div");
       bubble.className = `bubble ${role}`;
@@ -418,6 +651,33 @@ HTML_PAGE = """
       });
     }
 
+    function renderDocs() {
+      docsList.innerHTML = "";
+      docsListSidebar.innerHTML = "";
+
+      if (!loadedDocs.length) {
+        docsHint.textContent = "No documents queued.";
+        const sidebarEmpty = document.createElement("li");
+        sidebarEmpty.className = "history-empty";
+        sidebarEmpty.textContent = "No documents uploaded";
+        docsListSidebar.appendChild(sidebarEmpty);
+        return;
+      }
+
+      docsHint.textContent = `${loadedDocs.length} document(s) loaded for analysis in this chat.`;
+      loadedDocs.forEach((name) => {
+        const chip = document.createElement("div");
+        chip.className = "doc-chip";
+        chip.textContent = name;
+        docsList.appendChild(chip);
+
+        const li = document.createElement("li");
+        li.className = "history-item";
+        li.textContent = name;
+        docsListSidebar.appendChild(li);
+      });
+    }
+
     function pushPromptHistory(message) {
       const oneLine = message.replace(/\\s+/g, " ").trim();
       if (!oneLine) return;
@@ -436,17 +696,28 @@ HTML_PAGE = """
       resetBtn.disabled = isBusy;
       sidebarNewBtn.disabled = isBusy;
       inputEl.disabled = isBusy;
+      attachBtn.disabled = isBusy;
+      fileInput.disabled = isBusy;
       if (!isBusy) inputEl.focus();
     }
 
+    function buildMultipartPayload(message) {
+      const formData = new FormData();
+      formData.append("message", message);
+      for (const file of fileInput.files) {
+        formData.append("files", file);
+      }
+      return formData;
+    }
+
     async function streamMessage(message, targetBubble) {
+      const payload = buildMultipartPayload(message);
       const res = await fetch("/api/chat/stream", {
         method: "POST",
         headers: {
-          "Content-Type": "application/json",
           "Accept": "text/event-stream"
         },
-        body: JSON.stringify({message})
+        body: payload
       });
 
       if (!res.ok) {
@@ -492,6 +763,13 @@ HTML_PAGE = """
         if (eventName === "done") {
           targetBubble.textContent = payload.reply || streamedText || "(No response)";
           messagesEl.scrollTop = messagesEl.scrollHeight;
+          loadedDocs = payload.docs || loadedDocs;
+          renderDocs();
+          fileInput.value = "";
+
+          if (payload.upload_errors && payload.upload_errors.length) {
+            addMessage(`Upload warnings:\\n- ${payload.upload_errors.join("\\n- ")}`, "system");
+          }
           return;
         }
 
@@ -518,10 +796,16 @@ HTML_PAGE = """
     formEl.addEventListener("submit", async (event) => {
       event.preventDefault();
       const message = inputEl.value.trim();
-      if (!message) return;
+      const hasFiles = fileInput.files && fileInput.files.length > 0;
+      if (!message && !hasFiles) return;
 
-      pushPromptHistory(message);
-      addMessage(message, "user");
+      if (message) {
+        pushPromptHistory(message);
+        addMessage(message, "user");
+      } else {
+        addMessage("[Analyze uploaded documents]", "user");
+      }
+
       inputEl.value = "";
       autoResizeTextarea();
       const assistantMessage = addMessage("Thinking...", "assistant");
@@ -546,6 +830,21 @@ HTML_PAGE = """
 
     inputEl.addEventListener("input", autoResizeTextarea);
 
+    attachBtn.addEventListener("click", () => {
+      fileInput.click();
+    });
+
+    fileInput.addEventListener("change", () => {
+      const selectedNames = Array.from(fileInput.files || []).map((f) => f.name);
+      if (!selectedNames.length) {
+        docsHint.textContent = loadedDocs.length
+          ? `${loadedDocs.length} document(s) loaded for analysis in this chat.`
+          : "No documents queued.";
+        return;
+      }
+      docsHint.textContent = `Queued for upload: ${selectedNames.join(", ")}`;
+    });
+
     async function resetChat() {
       setBusy(true);
       try {
@@ -553,8 +852,11 @@ HTML_PAGE = """
         if (!res.ok) throw new Error("Could not reset chat.");
         messagesEl.innerHTML = "";
         promptHistory = [];
+        loadedDocs = [];
+        fileInput.value = "";
         renderPromptHistory();
-        addMessage("New chat started. Ask another research question.", "assistant");
+        renderDocs();
+        addMessage("New chat started. Upload docs or ask a research question.", "assistant");
       } catch (err) {
         addMessage(err.message, "system");
       } finally {
@@ -566,7 +868,8 @@ HTML_PAGE = """
     sidebarNewBtn.addEventListener("click", resetChat);
 
     renderPromptHistory();
-    addMessage("Hi. Ask me anything to research, and I will stream the reply as it is generated.", "assistant");
+    renderDocs();
+    addMessage("Hi, I am Jengo. I can research topics and analyze uploaded documents. Which sector or area do you want help with?", "assistant");
     autoResizeTextarea();
   </script>
 </body>
@@ -584,25 +887,46 @@ def chat():
     if RUNTIME_ERROR:
         return jsonify({"error": RUNTIME_ERROR}), 500
 
-    data = request.get_json(silent=True) or {}
-    user_message = str(data.get("message", "")).strip()
-    if not user_message:
+    user_message, uploads = _parse_chat_payload()
+    history = session.get("chat_history", [])
+    uploaded_docs = session.get("uploaded_docs", [])
+
+    uploaded_docs, _, upload_errors = _merge_uploaded_docs(uploaded_docs, uploads)
+    session["uploaded_docs"] = uploaded_docs
+    session.modified = True
+
+    document_context, document_sources = _build_document_context(uploaded_docs)
+    effective_query = user_message if user_message else (_default_query_for_docs() if document_context else "")
+    if not effective_query:
         return jsonify({"error": "Message cannot be empty."}), 400
 
-    history = session.get("chat_history", [])
     try:
-        response = run_research(query=user_message, chat_history=history, runtime=RUNTIME)
+        response = run_research(
+            query=effective_query,
+            chat_history=history,
+            runtime=RUNTIME,
+            document_context=document_context,
+            document_sources=document_sources,
+        )
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
     assistant_reply = format_response(response)
+    user_echo = user_message if user_message else "[Analyze uploaded documents]"
 
-    history.append({"role": "user", "content": user_message})
+    history.append({"role": "user", "content": user_echo})
     history.append({"role": "assistant", "content": assistant_reply})
     session["chat_history"] = history
     session.modified = True
 
-    return jsonify({"reply": assistant_reply, "structured": response.model_dump()})
+    return jsonify(
+        {
+            "reply": assistant_reply,
+            "structured": response.model_dump(),
+            "docs": [doc["name"] for doc in uploaded_docs],
+            "upload_errors": upload_errors,
+        }
+    )
 
 
 @app.post("/api/chat/stream")
@@ -610,22 +934,31 @@ def chat_stream():
     if RUNTIME_ERROR:
         return jsonify({"error": RUNTIME_ERROR}), 500
 
-    data = request.get_json(silent=True) or {}
-    user_message = str(data.get("message", "")).strip()
-    if not user_message:
+    user_message, uploads = _parse_chat_payload()
+    history = session.get("chat_history", [])
+    uploaded_docs = session.get("uploaded_docs", [])
+
+    uploaded_docs, _, upload_errors = _merge_uploaded_docs(uploaded_docs, uploads)
+    session["uploaded_docs"] = uploaded_docs
+    session.modified = True
+
+    document_context, document_sources = _build_document_context(uploaded_docs)
+    effective_query = user_message if user_message else (_default_query_for_docs() if document_context else "")
+    if not effective_query:
         return jsonify({"error": "Message cannot be empty."}), 400
 
-    history = session.get("chat_history", [])
     token_queue: queue.Queue = queue.Queue()
     result_holder: dict[str, Any] = {}
 
     def worker() -> None:
         try:
             response = run_research(
-                query=user_message,
+                query=effective_query,
                 chat_history=history,
                 runtime=RUNTIME,
                 callbacks=[TokenQueueHandler(token_queue)],
+                document_context=document_context,
+                document_sources=document_sources,
             )
             result_holder["response"] = response
         except Exception as exc:
@@ -653,14 +986,21 @@ def chat_stream():
             return
 
         assistant_reply = format_response(response)
-        history.append({"role": "user", "content": user_message})
+        user_echo = user_message if user_message else "[Analyze uploaded documents]"
+        history.append({"role": "user", "content": user_echo})
         history.append({"role": "assistant", "content": assistant_reply})
         session["chat_history"] = history
+        session["uploaded_docs"] = uploaded_docs
         session.modified = True
 
         yield sse_event(
             "done",
-            {"reply": assistant_reply, "structured": response.model_dump()},
+            {
+                "reply": assistant_reply,
+                "structured": response.model_dump(),
+                "docs": [doc["name"] for doc in uploaded_docs],
+                "upload_errors": upload_errors,
+            },
         )
 
     return Response(
@@ -673,6 +1013,7 @@ def chat_stream():
 @app.post("/api/reset")
 def reset():
     session["chat_history"] = []
+    session["uploaded_docs"] = []
     session.modified = True
     return jsonify({"ok": True})
 
