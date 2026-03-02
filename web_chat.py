@@ -73,16 +73,12 @@ class TokenQueueHandler(BaseCallbackHandler):
 
 
 def format_response(response: ResearchResponse) -> str:
-    lines = [f"Topic: {response.topic}", "", response.summary]
-    if response.sources:
-        lines.append("")
-        lines.append("Sources:")
-        lines.extend([f"- {source}" for source in response.sources])
-    if response.tools_used:
-        lines.append("")
-        lines.append("Tools Used:")
-        lines.extend([f"- {tool}" for tool in response.tools_used])
-    return "\n".join(lines)
+    summary = str(response.summary or "").strip()
+    if not summary:
+        summary = "I can help with research and analysis. Tell me what area you want to focus on."
+
+    # Keep user-facing chat replies conversational; do not expose internal metadata.
+    return summary
 
 
 def sse_event(event: str, data: dict[str, Any]) -> str:

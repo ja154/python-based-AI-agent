@@ -53,6 +53,18 @@ PROFILE_QUERY_HINTS = [
     "use case",
     "what do you do",
 ]
+SMALLTALK_HINTS = [
+    "hello",
+    "hi",
+    "hey",
+    "yo",
+    "good morning",
+    "good afternoon",
+    "good evening",
+    "how are you",
+    "what's up",
+    "whats up",
+]
 
 
 class ResearchResponse(BaseModel):
@@ -99,6 +111,27 @@ def _build_profile_response() -> ResearchResponse:
         summary=summary,
         sources=[],
         tools_used=["self_profile"],
+    )
+
+
+def _is_smalltalk_query(query: str) -> bool:
+    lowered = query.lower().strip()
+    if not lowered:
+        return False
+    return any(hint in lowered for hint in SMALLTALK_HINTS)
+
+
+def _build_smalltalk_response() -> ResearchResponse:
+    summary = (
+        "Hi, I am Jengo. I can help you research topics or analyze uploaded documents.\n\n"
+        "Tell me what you want to work on and the sector/area (for example: software engineering, "
+        "business, education, healthcare, finance, operations, or policy)."
+    )
+    return ResearchResponse(
+        topic="Greeting",
+        summary=summary,
+        sources=[],
+        tools_used=["smalltalk_router"],
     )
 
 
@@ -481,6 +514,8 @@ def run_research(
     # Deterministic identity/capability reply so the agent stays consistent.
     if _is_profile_query(cleaned_query):
         return _build_profile_response()
+    if _is_smalltalk_query(cleaned_query):
+        return _build_smalltalk_response()
 
     active_runtime = runtime if runtime is not None else build_research_runtime()
 
